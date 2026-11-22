@@ -32,8 +32,8 @@ env:
   PACKAGE_NAME: com.larus.nova
   KMI_DDK_RELEASE: '20260828'
   NDK_VERSION: '29.0.14206865'
-  BUILD_TOOLS: '37.0.0'
-  COMPILE_SDK: '37'
+  BUILD_TOOLS: '36.0.0'
+  COMPILE_SDK: '36'
 
 jobs:
   prepare:
@@ -159,8 +159,15 @@ jobs:
           SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
           [ -x "$SDKM" ] || SDKM="$(command -v sdkmanager)"
           yes | "$SDKM" --licenses >/dev/null || true
-          "$SDKM" --install "ndk;${NDK_VERSION}" "platforms;android-${COMPILE_SDK}" "build-tools;${BUILD_TOOLS}" >/dev/null
-          echo "ANDROID_NDK_HOME=$SDK/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "installed platforms:"; ls "$SDK/platforms" || true
+          echo "installed NDKs:"; ls "$SDK/ndk" || true
+          "$SDKM" --install "ndk;${NDK_VERSION}" >/dev/null || true
+          NDK_DIR="$SDK/ndk/${NDK_VERSION}"
+          if [ ! -d "$NDK_DIR" ]; then
+            NDK_DIR=$(find "$SDK/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          fi
+          test -d "$NDK_DIR"
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
 
       - name: Install Rust target
         run: |
@@ -243,12 +250,19 @@ jobs:
           SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
           [ -x "$SDKM" ] || SDKM="$(command -v sdkmanager)"
           yes | "$SDKM" --licenses >/dev/null || true
+          echo "installed platforms:"; ls "$SDK/platforms" || true
+          echo "installed NDKs:"; ls "$SDK/ndk" || true
           "$SDKM" --install \
             "platforms;android-${COMPILE_SDK}" \
             "build-tools;${BUILD_TOOLS}" \
             "ndk;${NDK_VERSION}" \
-            "cmake;3.22.1" >/dev/null
-          echo "ANDROID_NDK_HOME=$SDK/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+            "cmake;3.22.1" >/dev/null || true
+          NDK_DIR="$SDK/ndk/${NDK_VERSION}"
+          if [ ! -d "$NDK_DIR" ]; then
+            NDK_DIR=$(find "$SDK/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          fi
+          test -d "$NDK_DIR"
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
 
       - name: Download ksud artifacts
         uses: actions/download-artifact@v4
@@ -310,6 +324,9 @@ jobs:
           APK=$(find manager/app/build/outputs/apk/release -name '*.apk' | head -n 1)
           test -n "$APK"
           BT="${ANDROID_HOME}/build-tools/${BUILD_TOOLS}"
+          if [ ! -x "$BT/apksigner" ]; then
+            BT=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          fi
           "$BT/apksigner" verify --verbose --print-certs "$APK"
           "$BT/aapt2" dump badging "$APK" | grep -E "^package:|^application-label"
           echo "BUILT_APK=$APK" >> "$GITHUB_ENV"
