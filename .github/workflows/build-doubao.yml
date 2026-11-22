@@ -32,8 +32,9 @@ env:
   PACKAGE_NAME: com.larus.nova
   KMI_DDK_RELEASE: '20260828'
   NDK_VERSION: '29.0.14206865'
-  BUILD_TOOLS: '36.0.0'
-  COMPILE_SDK: '36'
+  BUILD_TOOLS: '37.0.0'
+  # The stable package is platforms;android-37.2; AGP's minorApiLevel is 2.
+  COMPILE_SDK: '37.2'
 
 jobs:
   prepare:
