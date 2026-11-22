@@ -192,7 +192,9 @@ jobs:
             *) echo "unknown target"; exit 1 ;;
           esac
           mkdir -p "userspace/ksud/bin/$arch"
-          if [ "$arch" != "arm" ]; then
+          # The LKM matrix builds aarch64 modules only. Do not put them in the
+          # x86_64/arm asset dirs: the kernel would reject the wrong machine.
+          if [ "$arch" = "aarch64" ]; then
             cp lkm/*_kernelsu.ko "userspace/ksud/bin/$arch/"
           fi
           ls -l "userspace/ksud/bin/$arch"
