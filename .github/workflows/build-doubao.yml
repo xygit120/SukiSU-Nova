@@ -1,0 +1,359 @@
+name: Build Doubao Manager
+
+# Builds the Doubao-branded manager (com.larus.nova) together with the
+# kernelsu.ko modules and ksud binaries that trust its signing certificate.
+# The kernel is compiled with KSU_PACKAGE_NAME=com.larus.nova and the
+# certificate size/hash of DOUBAO_KEYSTORE_BASE64, so a boot image patched
+# with this build only recognises this manager.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kmis:
+        description: 'KMI list as a JSON array'
+        required: false
+        default: '["android12-5.10","android13-5.10","android13-5.15","android14-5.15","android14-6.1","android15-6.6","android16-6.12","android17-6.18"]'
+        type: string
+      create_release:
+        description: 'Create a GitHub release with the APK and modules'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: doubao-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  PACKAGE_NAME: com.larus.nova
+  KMI_DDK_RELEASE: '20260828'
+  NDK_VERSION: '29.0.14206865'
+  BUILD_TOOLS: '37.0.0'
+  COMPILE_SDK: '37'
+
+jobs:
+  prepare:
+    name: Prepare version and signing certificate
+    runs-on: ubuntu-latest
+    outputs:
+      version_code: ${{ steps.version.outputs.version_code }}
+      expected_size: ${{ steps.cert.outputs.expected_size }}
+      expected_hash: ${{ steps.cert.outputs.expected_hash }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version code
+        id: version
+        run: |
+          set -euo pipefail
+          count=$(git rev-list --count HEAD)
+          code=$((30000 + count + 996))
+          echo "main commits: $count"
+          echo "version code: $code"
+          echo "version_code=$code" >> "$GITHUB_OUTPUT"
+
+      - name: Extract signing certificate
+        id: cert
+        env:
+          KEYSTORE_BASE64: ${{ secrets.DOUBAO_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.DOUBAO_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.DOUBAO_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_BASE64" || { echo "DOUBAO_KEYSTORE_BASE64 secret is missing"; exit 1; }
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/doubao.jks"
+          keytool -exportcert \
+            -alias "$KEY_ALIAS" \
+            -keystore "$RUNNER_TEMP/doubao.jks" \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -file "$RUNNER_TEMP/doubao.der"
+          size=$(stat -c%s "$RUNNER_TEMP/doubao.der")
+          hex=$(printf '0x%x' "$size")
+          hash=$(sha256sum "$RUNNER_TEMP/doubao.der" | awk '{print $1}')
+          echo "expected_size=$hex" >> "$GITHUB_OUTPUT"
+          echo "expected_hash=$hash" >> "$GITHUB_OUTPUT"
+          echo "certificate size: $hex"
+          echo "certificate hash: $hash"
+          grep -q "KSU_EXPECTED_SIZE ?= $hex" kernel/Kbuild
+          grep -q "$hash" kernel/Kbuild
+
+  lkm:
+    name: LKM ${{ matrix.kmi }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kmi: ${{ fromJSON(inputs.kmis) }}
+    env:
+      KMI: ${{ matrix.kmi }}
+      EXPECTED_SIZE: ${{ needs.prepare.outputs.expected_size }}
+      EXPECTED_HASH: ${{ needs.prepare.outputs.expected_hash }}
+      KSU_VERSION: ${{ needs.prepare.outputs.version_code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Build kernelsu.ko (aarch64)
+        run: |
+          set -euo pipefail
+          docker run --rm --privileged \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            -e KMI \
+            -e EXPECTED_SIZE \
+            -e EXPECTED_HASH \
+            -e KSU_VERSION \
+            -e PACKAGE_NAME \
+            "ghcr.io/ylarod/ddk-min:${KMI}-${KMI_DDK_RELEASE}" \
+            bash -lc '
+              set -eux
+              cd kernel
+              make CONFIG_KSU=m CONFIG_KPM=y CC=clang \
+                KSU_PACKAGE_NAME="$PACKAGE_NAME" \
+                KSU_EXPECTED_SIZE="$EXPECTED_SIZE" \
+                KSU_EXPECTED_HASH="$EXPECTED_HASH" \
+                KSU_VERSION="$KSU_VERSION"
+              mkdir -p ../out
+              cp kernelsu.ko "../out/${KMI}_kernelsu.ko"
+              llvm-strip -d "../out/${KMI}_kernelsu.ko" || true
+            '
+          ls -l out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lkm-${{ matrix.kmi }}
+          path: out/${{ matrix.kmi }}_kernelsu.ko
+          if-no-files-found: error
+
+  ksud:
+    name: ksud ${{ matrix.target }}
+    needs: [prepare, lkm]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-linux-android
+          - armv7-linux-androideabi
+          - x86_64-linux-android
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Android NDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKM" ] || SDKM="$(command -v sdkmanager)"
+          yes | "$SDKM" --licenses >/dev/null || true
+          "$SDKM" --install "ndk;${NDK_VERSION}" "platforms;android-${COMPILE_SDK}" "build-tools;${BUILD_TOOLS}" >/dev/null
+          echo "ANDROID_NDK_HOME=$SDK/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Install Rust target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add "${{ matrix.target }}" --toolchain stable
+
+      - name: Download LKM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: lkm-*
+          path: lkm
+          merge-multiple: true
+
+      - name: Prepare embedded assets
+        run: |
+          set -euo pipefail
+          case "${{ matrix.target }}" in
+            aarch64-linux-android) arch=aarch64 ;;
+            armv7-linux-androideabi) arch=arm ;;
+            x86_64-linux-android) arch=x86_64 ;;
+            *) echo "unknown target"; exit 1 ;;
+          esac
+          mkdir -p "userspace/ksud/bin/$arch"
+          if [ "$arch" != "arm" ]; then
+            cp lkm/*_kernelsu.ko "userspace/ksud/bin/$arch/"
+          fi
+          ls -l "userspace/ksud/bin/$arch"
+
+      - name: Build ksuinit
+        run: |
+          set -euo pipefail
+          source .github/scripts/setup-rust-build.sh "${{ matrix.target }}" 26
+          case "${{ matrix.target }}" in
+            aarch64-linux-android) abi=aarch64; arch=aarch64 ;;
+            armv7-linux-androideabi) abi=arm; arch=arm ;;
+            x86_64-linux-android) abi=x86_64; arch=x86_64 ;;
+          esac
+          builtins="$($CLANG_PATH --print-resource-dir)/lib/linux/libclang_rt.builtins-${abi}-android.a"
+          test -f "$builtins"
+          export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wno-unused-command-line-argument -C link-arg=$builtins"
+          cargo +stable build --package ksuinit --target "${{ matrix.target }}" --release
+          cp "target/${{ matrix.target }}/release/ksuinit" "userspace/ksud/bin/$arch/ksuinit"
+
+      - name: Build ksud
+        env:
+          KSU_PACKAGE_NAME: com.larus.nova
+        run: |
+          set -euo pipefail
+          source .github/scripts/setup-rust-build.sh "${{ matrix.target }}" 26
+          cargo +stable build --target "${{ matrix.target }}" --release \
+            --manifest-path userspace/ksud/Cargo.toml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ksud-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/ksud
+          if-no-files-found: error
+
+  manager:
+    name: Manager APK
+    needs: [prepare, ksud]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK and NDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKM" ] || SDKM="$(command -v sdkmanager)"
+          yes | "$SDKM" --licenses >/dev/null || true
+          "$SDKM" --install \
+            "platforms;android-${COMPILE_SDK}" \
+            "build-tools;${BUILD_TOOLS}" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;3.22.1" >/dev/null
+          echo "ANDROID_NDK_HOME=$SDK/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Download ksud artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ksud-*
+          path: ksud
+
+      - name: Copy ksud into the manager
+        run: |
+          set -euo pipefail
+          mkdir -p manager/app/src/main/jniLibs/arm64-v8a
+          mkdir -p manager/app/src/main/jniLibs/armeabi-v7a
+          mkdir -p manager/app/src/main/jniLibs/x86_64
+          cp ksud/ksud-aarch64-linux-android/ksud manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+          cp ksud/ksud-armv7-linux-androideabi/ksud manager/app/src/main/jniLibs/armeabi-v7a/libksud.so
+          cp ksud/ksud-x86_64-linux-android/ksud manager/app/src/main/jniLibs/x86_64/libksud.so
+          chmod +x manager/app/src/main/jniLibs/*/libksud.so
+          ls -l manager/app/src/main/jniLibs/*/libksud.so
+
+      - name: Pre-seed KPM tools
+        run: |
+          set -euo pipefail
+          d=manager/app/build/generated/kpmTools
+          mkdir -p "$d/jniLibs/arm64-v8a" "$d/assets/kpm"
+          curl -fsSL --retry 3 \
+            https://raw.githubusercontent.com/SukiSU-Nova/SukiSU_patch/main/kpm/kptools-android \
+            -o "$d/jniLibs/arm64-v8a/libkptools.so"
+          curl -fsSL --retry 3 \
+            https://raw.githubusercontent.com/SukiSU-Nova/SukiSU_patch/main/kpm/kpimg \
+            -o "$d/assets/kpm/kpimg"
+          chmod +x "$d/jniLibs/arm64-v8a/libkptools.so"
+          ls -l "$d/jniLibs/arm64-v8a" "$d/assets/kpm"
+
+      - name: Write signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.DOUBAO_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_BASE64"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/doubao.jks"
+
+      - name: Build APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.DOUBAO_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.DOUBAO_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.DOUBAO_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          cd manager
+          ./gradlew --no-daemon assembleRelease \
+            -PKEYSTORE_FILE="$RUNNER_TEMP/doubao.jks" \
+            -PKEYSTORE_PASSWORD="$KEYSTORE_PASSWORD" \
+            -PKEY_ALIAS="$KEY_ALIAS" \
+            -PKEY_PASSWORD="$KEY_PASSWORD"
+
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          APK=$(find manager/app/build/outputs/apk/release -name '*.apk' | head -n 1)
+          test -n "$APK"
+          BT="${ANDROID_HOME}/build-tools/${BUILD_TOOLS}"
+          "$BT/apksigner" verify --verbose --print-certs "$APK"
+          "$BT/aapt2" dump badging "$APK" | grep -E "^package:|^application-label"
+          echo "BUILT_APK=$APK" >> "$GITHUB_ENV"
+
+      - name: Collect APK
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "$BUILT_APK" "dist/Doubao_v3.0.0-r1_${{ needs.prepare.outputs.version_code }}-release.apk"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Doubao-APK
+          path: dist/*.apk
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [prepare, manager, lkm]
+    if: ${{ inputs.create_release }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Doubao-APK
+          path: dist
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lkm-*
+          path: lkm
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="doubao-v3.0.0-r1-${{ needs.prepare.outputs.version_code }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/*.apk lkm/*.ko --clobber
+          else
+            gh release create "$tag" dist/*.apk lkm/*.ko \
+              --title "Doubao Manager ${{ needs.prepare.outputs.version_code }}" \
+              --notes "Doubao manager APK (com.larus.nova) with matching kernelsu.ko modules. Flash the module that matches the device KMI; the kernel trusts only this build's signing certificate."
+          fi
