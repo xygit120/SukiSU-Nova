@@ -25,8 +25,8 @@ val managerVersionCode = rootProject.extra["managerVersionCode"] as Int
 val managerVersionName = rootProject.extra["managerVersionName"] as String
 
 val isPrBuild = project.findProperty("IS_PR_BUILD")?.toString()?.toBoolean() ?: false
-val defaultManagerPackageName = if (isPrBuild) "com.sukisu.nova.pr" else "com.sukisu.nova"
-val defaultManagerName = if (isPrBuild) "SukiSU PR" else "SukiSU Nova"
+val defaultManagerPackageName = if (isPrBuild) "com.larus.nova.pr" else "com.larus.nova"
+val defaultManagerName = if (isPrBuild) "豆包 PR" else "豆包"
 val managerPackageName = project.findProperty("KSU_PACKAGE_NAME")?.toString() ?: defaultManagerPackageName
 val managerName = project.findProperty("KSU_NAME")?.toString() ?: defaultManagerName
 
@@ -194,8 +194,9 @@ androidComponents {
 }
 
 base {
+    // Keep the artifact name ASCII; the launcher label is the localized 豆包.
     archivesName.set(
-        "${managerName.replace(" ", "_")}_${managerVersionName}_${managerVersionCode}"
+        "${if (isPrBuild) "Doubao_PR" else "Doubao"}_${managerVersionName}_${managerVersionCode}"
     )
 }
 
