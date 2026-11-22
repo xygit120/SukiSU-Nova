@@ -367,6 +367,8 @@ jobs:
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
+          # The job has no checkout, so gh cannot discover the repository itself.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           tag="doubao-v3.0.0-r1-${{ needs.prepare.outputs.version_code }}"
